@@ -1,0 +1,501 @@
+import sys, os
+import matplotlib.pyplot as plt
+import numpy as np
+np.set_printoptions(threshold=np.inf)
+from matplotlib import rcParams
+from mpl_toolkits.mplot3d import Axes3D 
+import argparse
+from default_configs import noddy_exe,output_folder
+rcParams['font.size'] = 15
+
+#Determine the path of the repository to set paths correctly below.
+
+# repo_path = r'C:\Users\Sofia\Documents\Sofia\Noddy'
+# sys.path.insert(0, repo_path)
+
+import pynoddy
+import importlib
+importlib.reload(pynoddy)
+import pynoddy.history
+import pynoddy.experiment
+importlib.reload(pynoddy.experiment)
+rcParams.update({'font.size': 15})
+import pandas as pd
+import pickle
+import copy
+from tqdm import tqdm
+import time 
+import random
+import string
+
+# function to parse arguments to the script
+def parser():
+    parser = argparse.ArgumentParser(description="stochastic simulation of exhumation from a kinematic modeling")
+    parser.add_argument("ndraws", help="Number of simulations to be run",type=int)
+    parser.add_argument("interval", type=int, help="Indicator layer z-axis step size")
+    parser.add_argument("resolution", help="samples coord every res voxels",type=int)
+    parser.add_argument("--folder", help="folder where to store the output files", type=str, required=False, default="test")
+    return parser
+
+def parser_new():
+    parser = argparse.ArgumentParser(description="stochastic simulation of exhumation from a kinematic modeling")
+    parser.add_argument("ndraws", help="Number of simulations to be run",type=int)
+    #parser.add_argument("events", help="Event to modify", type = int)
+    #parser.add_argument("--property", help="property to change", nargs = '+', type = str)
+    #parser.add_argument("--standard_deviation", help = "uncertainty added to each property", nargs = '+', type = int)
+    parser.add_argument("--folder", help="folder where to store the output files", type=str, required=False, default="test")
+    return parser
+
+# function to clean temporary files
+def clean(label):
+    os.system(f"rm {output_folder}/noddy/*{label}*")
+    os.system(f"rm {output_folder}/history/*{label}*")
+
+# function to generate unique label string to avoid output files to be overwritten
+def generate_unique_label():
+    timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
+    random_string = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+    return f"{timestamp}_{random_string}"
+
+## generate the current time string i.e. June 25 - 20:41:26
+def time_string():
+    return time.strftime("%B %d - %H:%M:%S", time.localtime())
+
+#function for getting noddy model coordinates by Kaifeng Gao
+def ExtractCoords(hist_moment, lith, res, unique_label):
+    
+    # Compute noddy model for history file
+    temp_hist = f'{output_folder}/history/temp_hist_{unique_label}.his'
+    temp_out = f'{output_folder}/noddy/temp_out_{unique_label}'
+    hist_moment.write_history(temp_hist)
+    pynoddy.compute_model(temp_hist, temp_out, 
+                          noddy_path = noddy_exe)
+    N1 = pynoddy.output.NoddyOutput(temp_out)
+    #N1.plot_section('y', litho_filter = lith)
+    
+    #num_rock = N1.n_rocktypes   #number of rock types
+    sum_node = []   #stack the nodes in each interface
+    num_list = []   #output the node number in each interface
+    
+    if isinstance(lith, list):
+        #litho_list = list(range(1, num_rock+1))  ##the lithoID in noddy begin at 2, lithoID could be a lis
+        for i in lith:
+            rockID = i*2  #because points = np.absolute(points/2), multiply 2 in advance
+            out = N1.get_surface_grid(lithoID=[i], res=res)  #here can change the sampling number by changing res
+            listx = out[0][0][i]   #out[0]：get_surface_grid, only choose first direction；out[0][0]: x values in x-grid
+            listy = out[0][1][i]   #y values
+            listz = out[0][2][i]
+            xx = sum(listx, [])  #multi-rows to one row
+            yy = sum(listy, [])
+            zz = sum(listz, [])
+            num_node = 0
+            for j in range(len(xx)):
+                #if xx[j] <-1 and yy[j]<-1 and zz[j]<-1:
+                sum_node.append([xx[j],yy[j],zz[j],rockID])
+                #num_node +=1
+            #num_list.append(num_node)
+
+        
+    #get_surface_grid function will get negative value, and twice the value, don't know the reason
+    points = np.array(sum_node)
+    points = np.absolute(points/2)
+    np.set_printoptions(precision=2) #two decimal places
+    np.set_printoptions(suppress=True) #don't use scientific notation
+
+    return points, num_list, N1, temp_hist
+
+def ExtractCoordsSimple(output, lith, res):
+    
+    # Compute noddy model for history file
+    sum_node = []
+    if isinstance(lith, list):
+        #litho_list = list(range(1, num_rock+1))  ##the lithoID in noddy begin at 2, lithoID could be a lis
+        for i in lith:
+            rockID = i*2  #because points = np.absolute(points/2), multiply 2 in advance
+            out = output.get_surface_grid(lithoID=[i], res=res)  #here can change the sampling number by changing res
+            listx = out[0][0][i]   #out[0]：get_surface_grid, only choose first direction；out[0][0]: x values in x-grid
+            listy = out[0][1][i]   #y values
+            listz = out[0][2][i]
+            xx = sum(listx, [])  #multi-rows to one row
+            yy = sum(listy, [])
+            zz = sum(listz, [])
+            for j in range(len(xx)):
+                sum_node.append([xx[j],yy[j],zz[j],rockID])
+        
+    #get_surface_grid function will get negative value, and twice the value, don't know the reason
+    points = np.array(sum_node)
+    points = np.absolute(points/2)
+    np.set_printoptions(precision=2) #two decimal places
+    np.set_printoptions(suppress=True) #don't use scientific notation
+
+    return points
+
+def disturb_percent(event, prop, percent = 30):
+    """Disturb the property of an event by a given percentage, assuming a normal distribution"""
+    ori_val = event.properties[prop]
+    new_val = np.random.randn() * percent/100. * ori_val + ori_val
+    event.properties[prop] = new_val
+    
+    return new_val
+    
+def disturb_value(event, prop, stdev):
+    """Disturb the property of an event by a given stdev, assuming a normal distribution"""
+    ori_val = event.properties[prop]
+    new_val = np.random.normal(ori_val, stdev)
+    event.properties[prop] = new_val
+    
+    return new_val
+
+
+def disturb(PH_local, std_list, ndraw):
+    data = []
+    for event_name, event in PH_local.events.items():
+        if isinstance(event, pynoddy.events.Fault):
+            new_slip = disturb_value(event, 'Slip', std_list[0])
+            new_amp = disturb_value(event, 'Amplitude', std_list[1])
+            new_x = disturb_value(event, 'X', std_list[2])
+            #new_dip = disturb_percent(event, 'Dip', percent=5)
+            new_dipdir = disturb_percent(event, 'Dip Direction', std_list[3])
+            #new_pitch = disturb_percent(event, 'Pitch', percent=5)
+            #new_z = disturb_value(event, 'Z', 75)
+            data.append([event_name, new_slip, new_amp, new_x, new_dipdir, ndraw])
+    
+    columns = ['Event', 'New Slip', 'New Amplitude', 'New X', 'New Dip Direction','nDraw']
+    df = pd.DataFrame(data, columns=columns)
+    return data, df
+
+
+def exhumationComplex(ndraw, history, lith, res = 8, interval = 50, upperlim = 0, unique_label="20235555555555_AAAAAA"):
+    
+    """function for estimating the exhumation (vertical movement) from a noddy history. Arguments:
+            lith: lith id of the dyke or item used to track the movement
+            res: 
+            interval: sampling interval in the z direction 
+            upperlim: limit up to which sampling is performed.
+            """
+    
+    new_z = upperlim - 1
+    n_sample = 0
+    
+    coords = []
+    hist_copy = copy.deepcopy(history)
+    
+    while new_z < upperlim:
+        n_sample += 1
+        
+        for event in hist_copy.events.values():
+            if isinstance(event, pynoddy.events.Dyke):
+                old_z = event.properties['Z']
+                new_z = old_z + interval
+                event.properties['Z'] = new_z
+                print(f"[{time_string()}] Processing indicator at z = {new_z} ...")
+    
+                points,_,N1,_ = ExtractCoords(hist_copy, lith, res, unique_label) #make sure that the history is at least cube size 100.
+                
+                try:
+                    x = points[...,0]
+                    y = points[...,1]
+                    z = points[...,2]
+                except IndexError:
+                    print("Point assignment failed")
+                    continue
+                
+                #correct for weird noddy coordinates
+                #real_z = points[0][2] #select the Z value of the first row.
+                real_z = points[...,2].min() #select the minimum z value - that's the original depth
+                exhumation =  z - real_z
+                print(f"[{time_string()}] Processing indicator at z = {new_z} ... Done")
+        
+        for j in range(len(x)):    
+            #coords.append([n_sample,x[j],y[j],z[j],exhumation[j],ndraw])
+            coords.append([n_sample,x[j],y[j],z[j],exhumation[j]])
+        
+        #coords = np.array(coords)
+            
+    return coords, N1, hist_copy
+
+#INVERSION FUNCTIONS
+def create_pdf(mean, std_dev):
+    def pdf(x):
+        coeff = 1 / (std_dev * np.sqrt(2 * np.pi))
+        exponent = - ((x - mean) ** 2) / (2 * std_dev ** 2)
+        return coeff * np.exp(exponent)
+    return pdf
+
+def prior_dist(og_params,proposed_params,std_list):
+    prior_prob = 1.0
+    for i in range(len(og_params)):
+        for j in range(len(std_list)):
+            pdf = create_pdf(og_params[i][j+1], std_list[j])
+            prior_prob *= pdf(proposed_params[i][j+1])
+    return prior_prob
+
+def likelihood(samples_df):
+    likelihood = 1.0
+    
+    for i in range(len(samples_df)):
+        if samples_df.iloc[i]['group'] in ['a']:
+            if samples_df.iloc[i]['exhumation'] < 30: #non reset AFT sample (B60, always accepted) strict
+                likelihood *= 10
+                
+            else:
+                proximity = (samples_df.iloc[i]['exhumation'][0] - 30) / 30
+                rf = np.exp(-25 * proximity)
+                likelihood *= rf
+                
+        
+        elif samples_df.iloc[i]['group'] in ['b']:
+            if samples_df.iloc[i]['exhumation'] > 48: #reset AFT sample (B10, never accepted) not strict
+                likelihood *= 30
+            else:
+                #proximity = (48 - samples_df.iloc[i]['exhumation'][0]) / 48
+                #rf = np.exp(-2 * proximity)
+                likelihood *= 5
+                
+                
+        elif samples_df.iloc[i]['group'] in ['c']: #this should be a strict criteria #reset AHe, partially reset AFT
+            if samples_df.iloc[i]['exhumation'] > 32 and samples_df.iloc[i]['exhumation'] < 48:
+                likelihood *= 10
+            else:
+                likelihood *= 0.05
+                
+        elif samples_df.iloc[i]['group'] in ['d']: #reset AHe samples
+            if samples_df.iloc[i]['exhumation'] > 32:
+                likelihood *= 10
+            else:
+                proximity = (32 - samples_df.iloc[i]['exhumation'][0]) / 32
+                rf = np.exp(-10 * proximity)
+                likelihood *= rf
+        else:
+            print('this is not a group')
+    return likelihood
+
+#MCMC USING INDEPENDENT PARAMETERS - FUNCTIONS
+#this function only works for the Bregenz model (it's resolution dependent and something else)
+def calc_new_position(output, lith_list,samples, diff, og_depths):
+    samples_noddy_pos = []
+    for i in lith_list:
+        p = ExtractCoordsSimple(output, lith = [i], res = 1)
+        t = p[...,2].min()
+        print(t)
+        z = (t*1000) / 3681.39
+        samples_noddy_pos.append(z)
+    
+    #if len(lith_list) > 1:
+    proposed_exhumation = [x - y - z for x,y,z in zip(samples_noddy_pos, diff, og_depths)]
+    #else:
+    #    proposed_exhumation = samples_noddy_pos - diff - og_depths
+    samples['exhumation'] = proposed_exhumation
+    return samples, samples_noddy_pos
+
+#this function is more general, I made it for the TRANSALP models but maybe it also works for other models
+#calculate the initial exhumation
+def calc_exhumation(output, conversion_factor, samples_df, og_depths):
+    samples_noddy_pos = []
+    for i in samples_df['lith_id']:
+        p = ExtractCoordsSimple(output, lith = [i], res = 2)
+        t = p[...,2].max() * conversion_factor
+        samples_noddy_pos.append(t) #this is the coordinate of the sample at the current time
+    exhumation = [x + y - z for x,y,z in zip(samples_noddy_pos, samples_df['z'], og_depths)]
+    samples_df['exhumation'] = exhumation
+    
+    return samples_df
+
+def disturb_property(PH_local, event_list, prop_list, std_list, recompute, unique_label):
+    data = []
+    for i in event_list:
+        event_data = [i]
+        for j, prop in enumerate(prop_list):
+            new_param = disturb_value(PH_local.events[i], prop_list[j], std_list[j])
+            rounded_param = round(new_param, -2) #round it to the nearest hundred (cubesize dependent!)
+            event_data.append(rounded_param)
+        data.append(event_data)
+    col = ['event_name'] + prop_list
+    df = pd.DataFrame(data, columns = col)
+
+    if recompute == True:
+        temp_hist = f'{output_folder}/history/temp_hist_{unique_label}.his'
+        temp_out = f'{output_folder}/noddy/temp_out_{unique_label}'
+        PH_local.write_history(temp_hist)
+        pynoddy.compute_model(temp_hist, temp_out,noddy_path = noddy_exe)
+        N1 = pynoddy.output.NoddyOutput(temp_out)
+    else:
+        N1 = 'Did not recompute the model'
+    return data, df, N1
+    
+def likelihood_and_score(samples_df):
+    
+    likelihood = 1.0
+    model_score = 0
+    samples_df['respected'] = 0
+    
+    for i in range(len(samples_df)):
+        if samples_df.iloc[i]['group'] in ['a']:
+            if samples_df.iloc[i]['exhumation'] < 4500: #non reset AFT sample (B60, always accepted) strict
+                likelihood *= 10
+                model_score += 1
+                samples_df.loc[i,'respected'] += 1
+                
+            else:
+                proximity = abs(4500 - samples_df.iloc[i]['exhumation'])
+                if proximity <= 500:
+                    likelihood *= 5
+                #rf = np.exp(-proximity)
+                else:
+                    likelihood *= 0.5
+                
+        
+        elif samples_df.iloc[i]['group'] in ['b']:
+            if samples_df.iloc[i]['exhumation'] > 4800: #reset AFT sample (B10, never accepted) not strict
+                likelihood *= 2
+                model_score += 1
+                samples_df.loc[i,'respected'] += 1
+            else:
+                proximity = (4800 - samples_df.iloc[i]['exhumation']) / 4800
+                rf = np.exp(-proximity)
+                likelihood *= rf
+                
+        elif samples_df.iloc[i]['group'] in ['c']: #this should be a strict criteria #reset AHe, partially reset AFT
+            if samples_df.iloc[i]['exhumation'] > 3200 and samples_df.iloc[i]['exhumation'] < 4800:
+                likelihood *= 100
+                model_score += 1
+                samples_df.loc[i,'respected'] += 1
+            else:
+                proximity = abs(3200 - samples_df.iloc[i]['exhumation'])
+                if proximity <= 2000:
+                    likelihood *= 5
+                else:
+                    likelihood *= 0.5
+                
+        elif samples_df.iloc[i]['group'] in ['d']: #reset AHe samples
+            if samples_df.iloc[i]['exhumation'] > 3200:
+                likelihood *= 5
+                model_score += 1
+                samples_df.loc[i,'respected'] += 1
+            else:
+                proximity = abs(3200 - samples_df.iloc[i]['exhumation'])
+                if proximity <= 100:
+                    rf = np.exp(-5*proximity/ 3200)
+                else:
+                    rf = np.exp(-20*proximity / 3200)
+                likelihood *= (rf) 
+                
+    return likelihood, model_score, samples_df
+            
+            
+
+def simple_likelihood(samples_df):
+    likelihood = 1.0
+    model_score = 0
+    
+    
+    if samples_df.loc['group'] in ['a']:
+        if samples_df.loc['exhumation'] < 3000: #non reset AFT sample (B60, always accepted) strict
+            likelihood *= 2
+            model_score += 1
+            samples_df.loc['respected'] += 1
+            
+        else:
+            proximity = (samples_df.loc['exhumation'] - 3000) / 3000
+            rf = np.exp(-proximity)
+            likelihood *= rf
+            
+    
+    elif samples_df.loc['group'] in ['b']:
+        if samples_df.loc['exhumation'] > 4800: #reset AFT sample (B10, never accepted) not strict
+            likelihood *= 2
+            model_score += 1
+            samples_df.loc['respected'] += 1
+        else:
+            proximity = (4800 - samples_df.loc['exhumation']) / 4800
+            rf = np.exp(-proximity)
+            likelihood *= rf
+            
+    elif samples_df.loc['group'] in ['c']: #this should be a strict criteria #reset AHe, partially reset AFT
+        if samples_df.loc['exhumation'] > 3200 and samples_df.loc['exhumation'] < 4800:
+            likelihood *= 4
+            model_score += 1
+            samples_df.loc['respected'] += 1
+        else:
+            likelihood *= 0.05
+            
+    elif samples_df.loc['group'] in ['d']: #reset AHe samples
+        if samples_df.loc['exhumation'] > 3200:
+            likelihood *= 100
+            model_score += 1
+            samples_df.loc['respected'] += 1
+        else:
+            proximity = abs(3200 - samples_df.loc['exhumation'])
+            if proximity <= 200:
+                rf = np.exp(-40*proximity/ 3200)
+            else:
+                rf = np.exp(-50*proximity / 3200)
+            likelihood *= (rf) 
+
+    return likelihood, model_score, samples_df
+
+def cont_likelihood(mu, sigma, x):
+    #mu is the model prediciton, sigma is the errorof the data and x is the observed data
+    # Calculate the likelihood using the Gaussian PDF
+    pdf = 1 / (sigma * np.sqrt(2 * np.pi)) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+    return pdf
+
+def synthetic_likelihood(exhumation_df, synthetic_data, sigma=800):
+    #The bigger the sigma, the bigger the likelihood
+    likelihood = 1.0
+    
+    for i in range(len(synthetic_data)):
+        modeled_value = exhumation_df.iloc[i]['exhumation']
+        data = synthetic_data[i][1]
+        
+        like_value = cont_likelihood(modeled_value, sigma, data)
+        likelihood *= like_value
+    
+    return likelihood
+
+def score_modelsel(samples_df, geo_gradient):
+    
+    model_score = 0
+    
+    ahe_min_exh, ahe_max_exh = (40/geo_gradient)*1000, (80/geo_gradient)*1000
+    aft_min_exh, aft_max_exh = (60/geo_gradient)*1000, (120/geo_gradient)*1000
+    zhe_min_exh, zhe_max_exh = (140/geo_gradient)*1000, (210/geo_gradient)*1000
+    zft_min_exh, zft_max_exh = (180/geo_gradient)*1000, (350/geo_gradient)*1000
+    
+    for i in range(len(samples_df)):
+        
+        if samples_df.iloc[i]['data_type'] in ['a']: #partially reset AHe,non-reset ZHe
+            if samples_df.iloc[i]['exhumation'] > ahe_min_exh and samples_df.iloc[i]['exhumation'] < ahe_max_exh:
+                model_score += 1
+                samples_df.loc[i, 'respected'] += 1
+            
+        elif samples_df.iloc[i]['data_type'] in ['b']: #reset AHe, AFT, non-reset ZHe, ZFT
+            if samples_df.iloc[i]['exhumation'] > aft_max_exh and samples_df.iloc[i]['exhumation'] < zhe_min_exh:
+                model_score += 1
+                samples_df.loc[i, 'respected'] += 1
+                
+        elif samples_df.iloc[i]['data_type'] in ['c']: #reset AHe, AFT, ZHe, partially reset ZFT
+            if samples_df.iloc[i]['exhumation'] > zhe_max_exh and samples_df.iloc[i]['exhumation'] < zft_max_exh:
+                model_score += 1
+                samples_df.loc[i, 'respected'] += 1
+            
+        elif samples_df.iloc[i]['data_type'] in ['d']: #reset AHe, AFT. partially reset ZHe, ZFT
+            if samples_df.iloc[i]['exhumation'] > zft_min_exh and samples_df.iloc[i]['exhumation'] < zhe_max_exh:
+                model_score += 1
+                samples_df.loc[i, 'respected'] += 1
+            
+        elif samples_df.iloc[i]['data_type'] in ['e']: #partially reset AHE, AFT. non-reset ZHe
+            if samples_df.iloc[i]['exhumation'] > aft_min_exh and samples_df.iloc[i]['exhumation'] < ahe_max_exh:
+                model_score += 1
+                samples_df.loc[i, 'respected'] += 1
+            
+        elif samples_df.iloc[i]['data_type'] in ['f']: #non-reset AFT
+            if samples_df.iloc[i]['exhumation'] < aft_min_exh:
+                model_score += 1
+                samples_df.loc[i, 'respected'] += 1
+            
+        elif samples_df.iloc[i]['data_type'] in ['g']: #all systems are reset
+            if samples_df.iloc[i]['exhumation'] > zft_max_exh:
+                model_score += 1
+                samples_df.loc[i, 'respected'] += 1
+    return samples_df, model_score
